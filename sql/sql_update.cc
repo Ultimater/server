@@ -222,6 +222,82 @@ static void prepare_record_for_error_message(int error, TABLE *table)
 }
 
 
+bool BLOB_VALUE_ORPHANAGE::init(TABLE *table_arg)
+{
+  table= table_arg;
+  if (table->s->virtual_fields && table->s->blob_fields)
+    return bitmap_init(&map, NULL, table->s->virtual_fields, FALSE);
+  map.bitmap= NULL;
+  return 0;
+}
+
+/** Remove blob's ownership from blob value memory
+
+  @note the memory becomes orphaned, it needs to be freed using
+  free_orphans() or re-attached back to blobs using adopt_orphans()
+*/
+void BLOB_VALUE_ORPHANAGE::make_orphans()
+{
+  DBUG_ASSERT(!table || !table->s->virtual_fields ||
+              !table->s->blob_fields || map.bitmap);
+  if (!map.bitmap)
+    return;
+
+  for (Field **ptr=table->vfield; *ptr; ptr++)
+  {
+    Field_blob *vb= (Field_blob*)(*ptr);
+    if (!(vb->flags & BLOB_FLAG) || !vb->owns_ptr(vb->get_ptr()))
+      continue;
+    bitmap_set_bit(&map, ptr - table->vfield);
+    vb->clear_temporary();
+  }
+}
+
+/** Frees orphaned blob values
+
+  @note It is assumed that value pointers are in table->record[1], while
+  Field_blob::ptr's point to table->record[0] as usual
+*/
+void BLOB_VALUE_ORPHANAGE::free_orphans()
+{
+  DBUG_ASSERT(!table || !table->s->virtual_fields ||
+              !table->s->blob_fields || map.bitmap);
+  if (map.bitmap)
+  {
+    for (Field **ptr=table->vfield; *ptr; ptr++)
+    {
+      Field_blob *vb= (Field_blob*)(*ptr);
+      if (!(vb->flags & BLOB_FLAG) ||
+          !bitmap_fast_test_and_clear(&map, ptr - table->vfield))
+        continue;
+      my_free(vb->get_ptr(table->s->rec_buff_length));
+    }
+    DBUG_ASSERT(bitmap_is_clear_all(&map));
+  }
+}
+
+
+/** Restores blob's ownership over previously orphaned values
+*/
+void BLOB_VALUE_ORPHANAGE::adopt_orphans()
+{
+  DBUG_ASSERT(!table || !table->s->virtual_fields ||
+              !table->s->blob_fields || map.bitmap);
+  if (map.bitmap)
+  {
+    for (Field **ptr=table->vfield; *ptr; ptr++)
+    {
+      Field_blob *vb= (Field_blob*)(*ptr);
+      if (!(vb->flags & BLOB_FLAG) ||
+          !bitmap_fast_test_and_clear(&map, ptr - table->vfield))
+        continue;
+      vb->own_value_ptr();
+    }
+    DBUG_ASSERT(bitmap_is_clear_all(&map));
+  }
+}
+
+
 /*
   Process usual UPDATE
 
@@ -273,6 +349,7 @@ int mysql_update(THD *thd,
   SORT_INFO     *file_sort= 0;
   READ_RECORD	info;
   SELECT_LEX    *select_lex= &thd->lex->select_lex;
+  BLOB_VALUE_ORPHANAGE vblobs;
   ulonglong     id;
   List<Item> all_fields;
   killed_state killed_status= NOT_KILLED;
@@ -724,6 +801,8 @@ int mysql_update(THD *thd,
 
   table->reset_default_fields();
 
+  vblobs.init(table);
+
   /*
     We can use compare_record() to optimize away updates if
     the table handler is returning all columns OR if
@@ -745,6 +824,9 @@ int mysql_update(THD *thd,
 
       explain->tracker.on_record_after_where();
       store_record(table,record[1]);
+
+      vblobs.make_orphans();
+
       if (fill_record_n_invoke_before_triggers(thd, table, fields, values, 0,
                                                TRG_EVENT_UPDATE))
         break; /* purecov: inspected */
@@ -904,7 +986,9 @@ int mysql_update(THD *thd,
       error= 1;
       break;
     }
+    vblobs.free_orphans();
   }
+  vblobs.free_orphans();
   ANALYZE_STOP_TRACKING(&explain->command_tracker);
   table->auto_increment_field_not_null= FALSE;
   dup_key_found= 0;
@@ -1752,6 +1836,8 @@ int multi_update::prepare(List<Item> &not_used_values,
 					      table_count);
   values_for_table= (List_item **) thd->alloc(sizeof(List_item *) *
 					      table_count);
+  vblobs= (BLOB_VALUE_ORPHANAGE *)thd->calloc(sizeof(*vblobs) * table_count);
+
   if (thd->is_fatal_error)
     DBUG_RETURN(1);
   for (i=0 ; i < table_count ; i++)
@@ -1784,6 +1870,7 @@ int multi_update::prepare(List<Item> &not_used_values,
       TABLE *table= ((Item_field*)(fields_for_table[i]->head()))->field->table;
       switch_to_nullable_trigger_fields(*fields_for_table[i], table);
       switch_to_nullable_trigger_fields(*values_for_table[i], table);
+      vblobs[i].init(table);
     }
   }
   copy_field= new Copy_field[max_fields];
@@ -2065,6 +2152,8 @@ multi_update::~multi_update()
 	free_tmp_table(thd, tmp_tables[cnt]);
 	tmp_table_param[cnt].cleanup();
       }
+      vblobs[cnt].free_orphans();
+      vblobs[cnt].free();
     }
   }
   if (copy_field)
@@ -2110,7 +2199,9 @@ int multi_update::send_data(List<Item> &not_used_values)
       can_compare_record= records_are_comparable(table);
 
       table->status|= STATUS_UPDATED;
+      vblobs[offset].free_orphans();
       store_record(table,record[1]);
+      vblobs[offset].make_orphans();
       if (fill_record_n_invoke_before_triggers(thd, table,
                                                *fields_for_table[offset],
                                                *values_for_table[offset], 0,
@@ -2327,6 +2418,7 @@ int multi_update::do_updates()
       goto err;
     }
     table->file->extra(HA_EXTRA_NO_CACHE);
+    empty_record(table);
 
     check_opt_it.rewind();
     while(TABLE *tbl= check_opt_it++)
@@ -2400,7 +2492,9 @@ int multi_update::do_updates()
         goto err2;
 
       table->status|= STATUS_UPDATED;
+      vblobs[offset].free_orphans();
       store_record(table,record[1]);
+      vblobs[offset].make_orphans();
 
       /* Copy data from temporary table to current table */
       for (copy_field_ptr=copy_field;
