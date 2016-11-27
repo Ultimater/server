@@ -569,6 +569,23 @@ uint Item::temporal_precision(enum_field_types type_arg)
 }
 
 
+void Item::print_parenthesised(String *str, enum_query_type query_type,
+                               enum precedence parent_prec)
+{
+  if (precedence() < parent_prec)
+    str->append('(');
+  print(str, query_type);
+  if (precedence() < parent_prec)
+    str->append(')');
+}
+
+
+void Item::print(String *str, enum_query_type query_type)
+{
+  str->append(full_name());
+}
+
+
 void Item::print_item_w_name(String *str, enum_query_type query_type)
 {
   print(str, query_type);
@@ -10464,9 +10481,11 @@ void Item::register_in(THD *thd)
 
 void Virtual_column_info::print(String *str)
 {
-  expr->print(str, (enum_query_type)(QT_ITEM_ORIGINAL_FUNC_NULLIF |
+  expr->print_parenthesised(str,
+                   (enum_query_type)(QT_ITEM_ORIGINAL_FUNC_NULLIF |
                                      QT_ITEM_IDENT_SKIP_DB_NAMES |
                                      QT_ITEM_IDENT_SKIP_TABLE_NAMES |
                                      QT_ITEM_CACHE_WRAPPER_SKIP_DETAILS |
-                                     QT_TO_SYSTEM_CHARSET));
+                                     QT_TO_SYSTEM_CHARSET),
+                   LOWEST_PRECEDENCE);
 }
